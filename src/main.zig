@@ -33,9 +33,10 @@ pub const Feed = struct {
         self.keychain.deinit();
         self.cache.deinit();
     }
-    fn _keyAt(self: *Feed, idx: usize) []u8 {
+
+    fn keyAt(self: *Feed, idx: usize) [PK_LEN]u8 {
         const o = self.keychain.items[idx];
-        return self.buf[o..(o + PK_LEN)];
+        return self.buf[o..][0..PK_LEN].*; // @ptrCast(*[PK_LEN]u8, self.buf[o..(o + PK_LEN)]);
     }
 
     // TODO: rename to fromBinary?
@@ -65,12 +66,12 @@ pub const Feed = struct {
                 // yield { type: 0, id: keyIdx, key: key, offset };
                 offset += end;
             } else {
-                const block = Block{ .buffer = self.buf[offset..] };
-                log.debug("Block s:{} {s}", .{ block.size(), block.body() });
-                const err = block.verify(self._keyAt(0));
+                const block = try Block.from(self.buf[offset..]);
+                log.debug("Block s:{} {s}", .{ block.size, block.body });
+                const err = block.verify(self.keyAt(0));
                 log.debug("isValid {!}", .{err});
-                const b = @ptrCast(*Block, self.buf.ptr + offset);
-                offset += block.total_size();
+
+                offset += block.block_size;
             }
         }
     }
@@ -92,54 +93,48 @@ fn parse16(chr: u8) u8 {
         else => 0,
     };
 }
-const BlockDecodeError = error {
-    InvalidLength
-};
+
 const Block = struct {
-    //// -----
-    pub const SIG_LEN = Sign.Signature.encoded_length;
-    pub const COUNT_TYPE = u32;
-    pub const COUNT_LEN = @divExact(@typeInfo(COUNT_TYPE).Int.bits, 8);
+    pub const DecodingError = error{InvalidLength};
+    /// 64bytes
+    pub const SIG_SZ = Sign.Signature.encoded_length;
+    sig: *[SIG_SZ]u8,
+    parent_sig: *[SIG_SZ]u8,
+    // 4 Bytes
+    /// `size` refers to block-body size
+    size: usize,
+    /// `block_size` refers to total block size
+    block_size: usize,
+    /// `dat` Cryptographically signed data
+    dat: []u8,
+    /// `body` Userspace data
+    body: []u8,
 
-    buffer: []u8,
+    pub fn from(bytes: []u8) !Block {
+        const hz = SIG_SZ * 2;
+        const oz = @divExact(@typeInfo(u32).Int.bits, 8);
+        // `bytes` needs to be at least Header + 1byte Body in length
+        if (bytes.len < hz + oz + 1) return DecodingError.InvalidLength;
+        // @ptrCast(*Block, self.buf.ptr + offset)
+        const body_size = std.mem.readIntBig(u32, bytes[hz..][0..oz]);
+        const block_size = hz + oz + body_size;
+        // `bytes` needs to contain enough data to cover body.
+        if (bytes.len < block_size) return DecodingError.InvalidLength;
 
-    pub fn sig(self: *const Block) []u8 {
-        return self.buffer[0..SIG_LEN];
-    }
-    pub fn parentSig(self: *const Block) [SIG_LEN]u8 {
-        return self.buffer[SIG_LEN..(SIG_LEN * 2)];
-    }
-
-    /// Size of block Body
-    pub fn size(self: *const Block) usize {
-        const o = SIG_LEN * 2;
-        const s = COUNT_LEN;
-        return std.mem.readIntBig(u32, self.buffer[o .. o + s]);
-    }
-
-    /// The data that is covered by the signature
-    pub fn data(self: *const Block) []u8 {
-        const o = SIG_LEN;
-        const end = (SIG_LEN * 2) + COUNT_LEN + self.size();
-        return self.buffer[o..end];
-    }
-
-    /// Userspace block-body
-    pub fn body(self: *const Block) []u8 {
-        const o = SIG_LEN * 2 + COUNT_LEN;
-        return self.buffer[o .. o + self.size()];
-    }
-
-    pub fn total_size(self: *const Block) usize {
-        return SIG_LEN * 2 + COUNT_LEN + self.size();
+        return Block{
+            .sig = bytes[0..SIG_SZ],
+            .parent_sig = bytes[SIG_SZ..hz],
+            .size = body_size,
+            .block_size = block_size,
+            .dat = bytes[SIG_SZ..block_size],
+            .body = bytes[hz + oz ..][0..body_size],
+        };
     }
 
-    pub fn verify(self: *const Block, public_key: []u8) !void {
-        const message = self.data();
-        const pk = try Sign.PublicKey.fromBytes(public_key[0..32].*);
-        const sig_bytes = self.buffer[0..SIG_LEN]; //self.sig();
-        const signature = Sign.Signature.fromBytes(sig_bytes.*);
-        try signature.verify(message, pk);
+    pub fn verify(self: *const Block, public_key: [Feed.PK_LEN]u8) !void {
+        const pk = try Sign.PublicKey.fromBytes(public_key[0..Feed.PK_LEN].*);
+        const signature = Sign.Signature.fromBytes(self.sig.*);
+        try signature.verify(self.dat, pk);
     }
 };
 
