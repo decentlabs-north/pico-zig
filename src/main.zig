@@ -1,32 +1,75 @@
-const std = @import("std");
-const crypto = std.crypto; // @import("crypto.zig");
-const Sign = crypto.sign.Ed25519;
 const testing = std.testing;
-const log = std.log.scoped(.pico);
-const hex = std.fmt.fmtSliceHexLower;
+const std = @import("std");
+const ArrayList = std.ArrayList;
+const U = @import("util.zig");
+const Block = @import("block.zig").Block;
+const Pickle = @import("pickle.zig");
+const Sign = U.Sign;
+const log = U.log;
+const hex = U.hex;
 // pub const log_level: std.log.Level = .info;
 
+/// Mimic JS-API, returns std.crypto.sign.Ed25519 keypair
+/// for convenience.
+pub fn signPair() Sign.KeyPair {
+    return try Sign.KeyPair.create(undefined);
+}
+
 pub const Feed = struct {
+    pub const KEY_GLYPH = U.key_glyph;
     pub const SecretKey = Sign.SecretKey;
     pub const PublicKey = Sign.PublicKey;
-    pub const KEY_GLYPH = "K0.";
     pub const PK_LEN = PublicKey.encoded_length;
     pub const SK_LEN = SecretKey.encoded_length;
 
     buf: []u8,
-    keychain: std.ArrayList(usize),
-    cache: std.ArrayList([]Block),
+    keychain: ArrayList([PK_LEN]u8),
+    cache: ArrayList(Block),
     tail: usize = 0,
 
-    pub fn append(self: *Feed, data: []const u8, sk: SecretKey) void {
-        log.debug("Kek {*} {*} {*}", .{ self, data, sk });
+    pub fn get(self: *Feed, idx: usize) Block {
+        return self.cache.items[idx];
     }
 
-    pub fn wrap(alc: std.mem.Allocator, data: []u8) anyerror!Feed {
-        var f = Feed{ .buf = data, .keychain = std.ArrayList(usize).init(alc), .cache = std.ArrayList([]Block).init(alc) };
-        f.tail = data.len;
+    pub fn append(self: *Feed, data: []const u8, sk: [SK_LEN]u8) !void {
+        const block_size = data.len + Block.HEADER_LENGTH;
+        log.debug("BS S:{} s{}", .{ self.buf.len, self.tail + block_size });
+        if (self.buf.len < self.tail + block_size) {
+            return error.OutOfMemory;
+        }
+        const l = @truncate(u32, data.len);
+        log.debug("BATMUT: {} => {}", .{ data.len, l });
+        std.mem.writeIntBig(
+            u32,
+            self.buf[self.tail + 2 * U.size.sig ..][0..4],
+            l,
+        );
+        var block = try Block.from(self.buf[self.tail..]);
+        log.debug("Block s:{} {s}", .{ block.size, block.body });
+        // std.mem.copy(u8, d
+        log.debug("Kek {s}", .{hex(&sk)});
+    }
+
+    /// Attach and read an existing binary feed buffer
+    pub fn wrap(alc: std.mem.Allocator, data: []u8) !Feed {
+        var f = Feed{
+            .buf = data,
+            .keychain = ArrayList([32]u8).init(alc),
+            .cache = ArrayList(Block).init(alc),
+            .tail = data.len, // Don't like this
+        };
         try f.index();
         return f;
+    }
+
+    pub fn create(alc: std.mem.Allocator, data: []u8) !Feed {
+        // try arr.appendSlice(@as([]const u8, "Hello"));
+        return Feed{
+            .buf = data,
+            .keychain = ArrayList([32]u8).init(alc),
+            .cache = ArrayList(Block).init(alc),
+            .tail = 0,
+        };
     }
 
     pub fn deinit(self: *Feed) void {
@@ -35,135 +78,97 @@ pub const Feed = struct {
     }
 
     fn keyAt(self: *Feed, idx: usize) [PK_LEN]u8 {
-        const o = self.keychain.items[idx];
-        return self.buf[o..][0..PK_LEN].*; // @ptrCast(*[PK_LEN]u8, self.buf[o..(o + PK_LEN)]);
+        return self.keychain.items[idx];
+        // return self.buf[o..][0..PK_LEN].*; // @ptrCast(*[PK_LEN]u8, self.buf[o..(o + PK_LEN)]);
+    }
+
+    pub fn iterator(self: *Feed) FeedIterator {
+        return .{ .data = self.buf[0..self.tail], .offset = 0 };
     }
 
     // TODO: rename to fromBinary?
-    fn index(self: *Feed) anyerror!void {
-        log.debug("Indexing", .{});
-        var offset: usize = 0;
+    fn index(self: *Feed) !void {
+        log.debug("Indexing, tail: {}", .{self.tail});
         // var blockIdx = 0;
-        while (true) {
-            if (offset >= self.tail) break;
-            if (offset + KEY_GLYPH.len > self.buf.len) break;
-            const isKey = std.mem.eql(u8, KEY_GLYPH, self.buf[offset..(offset + KEY_GLYPH.len)]);
-            log.debug("isKey: {}", .{isKey});
-            if (isKey) {
-                const start = offset + KEY_GLYPH.len;
-                const end = start + PK_LEN;
-                if (end > self.buf.len) @panic("InvalidKey");
-                const key_bytes = self.buf[start..end];
-                var found = false;
-                for (self.keychain.items) |o| {
-                    if (found) break;
-                    found = std.mem.eql(u8, key_bytes, self.buf[o .. o + PK_LEN]);
-                }
-                log.debug("Key: {} {s}", .{ found, hex(key_bytes) });
-                if (!found) {
-                    try self.keychain.append(start);
-                }
-                // yield { type: 0, id: keyIdx, key: key, offset };
-                offset += end;
-            } else {
-                const block = try Block.from(self.buf[offset..]);
-                log.debug("Block s:{} {s}", .{ block.size, block.body });
-                const err = block.verify(self.keyAt(0));
-                log.debug("isValid {!}", .{err});
-
-                offset += block.block_size;
+        var iter = self.iterator();
+        while (try iter.next()) |segment| {
+            switch (segment) {
+                .key => |public_key| {
+                    var found = false;
+                    for (self.keychain.items) |other| {
+                        if (found) break;
+                        found = std.mem.eql(u8, public_key, &other);
+                    }
+                    // log.debug("Key: {} {s}", .{ found, hex(public_key) });
+                    if (!found) {
+                        try self.keychain.append(public_key[0..PK_LEN].*);
+                    }
+                },
+                .block => |block| {
+                    try block.verify(self.keyAt(0));
+                    try self.cache.append(block);
+                },
             }
         }
     }
 };
 
-pub fn signPair() Sign.KeyPair {
-    return try Sign.KeyPair.create(undefined);
-}
+pub const SegmentType = enum { key, block };
+pub const FeedSegment = union(SegmentType) { key: []u8, block: Block };
 
-fn parse16(chr: u8) u8 {
-    return switch (chr) {
-        48...59 => chr - 48,
-        'a' => 10,
-        'b' => 11,
-        'c' => 12,
-        'd' => 13,
-        'e' => 14,
-        'f' => 15,
-        else => 0,
-    };
-}
-
-const Block = struct {
-    pub const DecodingError = error{InvalidLength};
-    /// 64bytes
-    pub const SIG_SZ = Sign.Signature.encoded_length;
-    sig: *[SIG_SZ]u8,
-    parent_sig: *[SIG_SZ]u8,
-    // 4 Bytes
-    /// `size` refers to block-body size
-    size: usize,
-    /// `block_size` refers to total block size
-    block_size: usize,
-    /// `dat` Cryptographically signed data
-    dat: []u8,
-    /// `body` Userspace data
-    body: []u8,
-
-    pub fn from(bytes: []u8) !Block {
-        const hz = SIG_SZ * 2;
-        const oz = @divExact(@typeInfo(u32).Int.bits, 8);
-        // `bytes` needs to be at least Header + 1byte Body in length
-        if (bytes.len < hz + oz + 1) return DecodingError.InvalidLength;
-        // @ptrCast(*Block, self.buf.ptr + offset)
-        const body_size = std.mem.readIntBig(u32, bytes[hz..][0..oz]);
-        const block_size = hz + oz + body_size;
-        // `bytes` needs to contain enough data to cover body.
-        if (bytes.len < block_size) return DecodingError.InvalidLength;
-
-        return Block{
-            .sig = bytes[0..SIG_SZ],
-            .parent_sig = bytes[SIG_SZ..hz],
-            .size = body_size,
-            .block_size = block_size,
-            .dat = bytes[SIG_SZ..block_size],
-            .body = bytes[hz + oz ..][0..body_size],
-        };
-    }
-
-    pub fn verify(self: *const Block, public_key: [Feed.PK_LEN]u8) !void {
-        const pk = try Sign.PublicKey.fromBytes(public_key[0..Feed.PK_LEN].*);
-        const signature = Sign.Signature.fromBytes(self.sig.*);
-        try signature.verify(self.dat, pk);
+pub const FeedIterator = struct {
+    data: []u8,
+    offset: usize,
+    pub fn next(self: *FeedIterator) !?FeedSegment {
+        const key_glyph = U.key_glyph;
+        if (self.offset >= self.data.len) return null;
+        if (self.offset + key_glyph.len > self.data.len) return null;
+        const isKey = std.mem.eql(u8, key_glyph, self.data[self.offset..][0..key_glyph.len]);
+        // if (!isKey and 0 == self.keychain.items.len) ;
+        if (isKey) {
+            const start = self.offset + key_glyph.len;
+            const end = start + U.size.pk;
+            if (end > self.data.len) return error.InvalidLength;
+            self.offset += end;
+            return .{ .key = self.data[start..end] };
+        } else {
+            const start = self.offset;
+            // Block.from handles size validations.
+            const block = try Block.from(self.data[start..]);
+            self.offset += block.block_size;
+            return .{ .block = block };
+        }
     }
 };
 
-test "basic add functionality" {
+test "Basic functionality" {
     testing.log_level = .debug;
-    try testing.expect(true);
-    // try testing.expect(add(3, 7) == 10);
-    // const f = Feed.create(allocator, size? = 65535);
-    // f.append(txt, kp);
-    const txt = "4b302e7f90d21dec34410f4c026541a324a989332aab65161cd8b341d72fb5adb552e1c7bd26c2bcd45ce2d307e4af42b5a310c867f58e424824533963c07d2eb15ee87f0b922a8487f1b5a24b652cf7918de8b7d8a265d3b7ff20d34233398a3ef801000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001d416c6c20796f7572206261736520697320616c6c206f75722062617365";
-    // log.debug("K: {s}", .{txt});
-
-    // parseHex can be done at comptime
-    var binFeed: [txt.len >> 1]u8 = undefined;
-    var prev: u8 = ' ';
-    for (txt) |chr, i| {
-        if (i % 2 != 0) {
-            binFeed[i >> 1] = (parse16(prev) << 4) + parse16(chr);
-        } else {
-            prev = chr;
-        }
-    }
-    log.debug("K: {s}", .{hex(&binFeed)});
-
-    // test index
     const test_allocator = testing.allocator;
-    var f = try Feed.wrap(test_allocator, &binFeed);
+
+    const pair = try Sign.KeyPair.create(undefined);
+    const sk = pair.secret_key.bytes;
+
+    // const buffer = try ArrayList(u8).initCapacity(test_allocator, 1024);
+    // defer buffer.deinit();
+    var buffer: [1024]u8 = undefined;
+
+    var f = try Feed.create(test_allocator, buffer[0..]);
     defer f.deinit();
-    log.debug("f {}", .{@TypeOf(f)});
+    f.tail = 0;
+    try f.append(@as([]const u8, "Hello Gentlemen"), sk);
+    try testing.expect(true);
+}
+
+test "Readonly feed from Pickle" {
+    testing.log_level = .debug;
+    const pickle = "PIC0.K0.f5DSHew0QQ9MAmVBoySpiTMqq2UWHNizQdcvta21UuEB0.x70mwrzUXOLTB-SvQrWjEMhn9Y5CSCRTOWPAfS6xXuh_C5IqhIfxtaJLZSz3kY3ot9iiZdO3_yDTQjM5ij74AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdQWxsIHlvdXIgYmFzZSBpcyBhbGwgb3VyIGJhc2U";
+    const arr = try Pickle.decode_pickle(testing.allocator, pickle);
+    defer arr.deinit();
+    var f = try Feed.wrap(testing.allocator, arr.items);
+    defer f.deinit();
+    try f.index();
+    const b: Block = f.get(0);
+    try testing.expectEqualStrings(b.body, "All your base is all our base");
 }
 
 // SK '653e9ae8f5ede09442895291afac3f587310a6ba6209d5b350d9c85b7b074f1d7f90d21dec34410f4c026541a324a989332aab65161cd8b341d72fb5adb552e1'
