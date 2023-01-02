@@ -5,20 +5,21 @@ const Sign = U.Sign;
 
 pub const Block = struct {
     pub const DecodingError = error{InvalidLength};
-
     /// 132bytes
     pub const HEADER_LENGTH = U.size.body_counter + U.size.sig * 2;
 
+    /// Block signature / BlockIdentity
     sig: *[U.size.sig]u8,
+    /// Signature of parent block
     parent_sig: *[U.size.sig]u8,
-    // 4 Bytes
-    /// `size` refers to block-body size
+    /// 4 Bytes
+    /// block-body size
     size: usize,
-    /// `block_size` refers to total block size
+    /// total block size in bytes
     block_size: usize,
-    /// `dat` Cryptographically signed data
+    /// Cryptographically signed data
     dat: []u8,
-    /// `body` Userspace data
+    /// Userspace data
     body: []u8,
 
     pub fn from(bytes: []u8) !Block {
