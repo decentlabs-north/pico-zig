@@ -7,7 +7,9 @@
                                    |___/
 ```
 
-Pico* is coming to Zig!
+[`Pico*`](https://github.com/telamon/picostack) is coming to Zig!
+
+Currently porting: https://github.com/telamon/picofeed
 
 Discord: https://discord.gg/8RMRUPZ9RS
 
