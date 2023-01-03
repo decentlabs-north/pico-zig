@@ -1,0 +1,7 @@
+# not a fan of phat-repos
+*
+!README.md
+!LICENSE
+!src/*
+!build.zig
+!.gitignore
