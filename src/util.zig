@@ -46,3 +46,14 @@ pub fn fromHex(comptime txt: []const u8) []const u8 {
     }
     return &bin;
 }
+
+pub fn sign(message: []const u8, secret: [size.sk]u8, noise: ?[Sign.noise_length]u8) ![size.sig]u8 {
+    const kp = try Sign.KeyPair.fromSecretKey(try Sign.SecretKey.fromBytes(secret));
+    const signature = try kp.sign(message, noise);
+    return signature.toBytes();
+}
+pub fn signVerify(signature: [size.sig]u8, message: []const u8, public_key: [size.pk]u8) !void {
+    const sig = Sign.Signature.fromBytes(signature);
+    const pk = try Sign.PublicKey.fromBytes(public_key);
+    try sig.verify(message, pk);
+}

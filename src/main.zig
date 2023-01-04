@@ -14,98 +14,111 @@ const Header = @import("block.zig").Header;
 pub inline fn signPair() Sign.KeyPair {
     return try Sign.KeyPair.create(undefined);
 }
-
+pub const genesis_signature = [_]u8{0} ** U.size.sig;
 pub const Feed = struct {
     const Self = @This();
     pub const KEY_GLYPH = U.key_glyph;
-    pub const SecretKey = Sign.SecretKey;
-    pub const PublicKey = Sign.PublicKey;
-    pub const PK_LEN = PublicKey.encoded_length;
-    pub const SK_LEN = SecretKey.encoded_length;
-
-    keychain: ArrayList([PK_LEN]u8),
-    cache: ArrayList(Block),
+    pub const PK_LEN = U.size.pk;
+    pub const SK_LEN = U.size.sk;
     buffer: union(enum) { ro: []const u8, rw: ArrayList(u8) },
 
-    inline fn items(self: *Self) []const u8 {
+    inline fn items(self: *const Self) []const u8 {
         switch (self.buffer) {
             .rw => |v| return v.items,
             .ro => |v| return v,
         }
     }
-    inline fn writable(self: *Self) ArrayList(u8) {
-        switch (self.buffer) {
-            .rw => |v| return v,
-            .ro => unreachable,
-        }
-    }
 
-    fn keyAt(self: *Self, idx: usize) ![PK_LEN]u8 {
+    pub fn blockAt(self: *const Self, idx: usize) !Block {
         var iter = self.iterator();
         var n: usize = 0;
-        while (iter.next()) |segment| {
-            switch (segment) {
-                .key => |k| {
-                    if (n == idx) return k[0..PK_LEN];
-                    n += 1;
-                },
-                else => {},
-            }
+        while (iter.nextBlock()) |b| {
+            if (n == idx) return b;
+            n += 1;
         }
         return error.InvalidIndex;
     }
 
-    pub fn block_at(self: *Self, idx: usize) !Block {
+    pub fn firstBlock(self: *const Self) ?Block {
+        var iter = self.iterator();
+        return iter.nextBlock();
+    }
+
+    pub fn lastBlock(self: *const Self) ?Block {
+        var block: Block = undefined;
         var iter = self.iterator();
         var n: usize = 0;
-        while (iter.next()) |segment| {
-            switch (segment) {
-                .block => |b| {
-                    if (n == idx) return b;
-                    n += 1;
-                },
-                else => {},
-            }
+        while (iter.nextBlock()) |b| : (n += 1) block = b;
+        if (n == 0) return null;
+        return block;
+    }
+
+    pub fn ensureKey(self: *Self, public_key: [PK_LEN]u8) !void {
+        // Check if key already exists
+        var iter = self.iterator();
+        while (iter.nextKey()) |key| {
+            const same = std.mem.eql(u8, &public_key, &key);
+            if (same) return; // Key exists
         }
-        return error.InvalidIndex;
+        // Key not found. append it.
+        // TODO: throw comptime error
+        const buffer = &self.buffer.rw;
+        const tail = buffer.items.len;
+        try buffer.resize(tail + PK_LEN + KEY_GLYPH.len);
+        std.mem.copy(u8, buffer.items[tail..], KEY_GLYPH);
+        std.mem.copy(u8, buffer.items[tail + KEY_GLYPH.len ..], &public_key);
     }
 
     pub fn append(self: *Self, data: []const u8, secret_key: [SK_LEN]u8) !void {
-        // TODO: self.ensureKey(sk[32..])
+        const pk = secret_key[PK_LEN..];
+        try self.ensureKey(pk.*);
         const block_size = data.len + U.size.header;
-        var memory = self.writable();
+        const memory = &self.buffer.rw;
         const tail = memory.items.len;
-        // TODO: self._last_block = tail
+        // TODO: self._last_block = tail (if we reimplement cache)
 
         const new_size = tail + block_size;
         if (new_size > U.block_limit) return error.FeedOverflow;
         try memory.resize(new_size);
+
         var buffer = memory.items[tail..][0..block_size];
         var header = @ptrCast(*Header, buffer.ptr);
-        const psig = [_]u8{0} ** 64; // TODO: lookup prev || genesis
-        std.mem.copy(u8, &header.parent_signature, &psig);
+
+        const parent = self.lastBlock();
+        if (parent == null) {
+            std.mem.copy(u8, &header.parent_signature, &genesis_signature);
+        } else {
+            const parent_header = parent.?.header;
+            std.mem.copy(u8, &header.parent_signature, &parent_header.signature);
+        }
+
         header.writeSize(@truncate(u32, data.len));
         std.mem.copy(u8, buffer[U.size.header..], data);
 
         const sign_data = buffer[U.size.sig..];
-        const kp = try Sign.KeyPair.fromSecretKey(try Sign.SecretKey.fromBytes(secret_key));
-        const signature = try kp.sign(sign_data, undefined);
-        const sig = signature.toBytes();
-        log.debug("SigGen: L:{}, Hex: {s}", .{ sig.len, hex(&sig) });
+        const sig: [64]u8 = try U.sign(sign_data, secret_key, undefined);
         std.mem.copy(u8, &header.signature, &sig);
         const block = try Block.from(buffer);
-        try block.verify(secret_key[32..]);
-        log.debug("Block s: {s}", .{block.body});
+        try block.verify(secret_key[32..].*);
     }
 
-    /// Attach to an existing buffer in readonly mode
-    pub fn wrap(alc: std.mem.Allocator, data: []const u8) !Feed {
-        var f = Feed{
+    /// Attach to an readonly buffer
+    /// without verifying signatures.
+    /// Use Feed.from(allocator, data) to
+    /// decode feeds from untrusted sources.
+    /// `data` must not contain any additional bytes/whitespace.
+    pub fn wrap(data: []const u8) Feed {
+        const f = Feed{
             .buffer = .{ .ro = data },
-            .keychain = ArrayList([32]u8).init(alc),
-            .cache = ArrayList(Block).init(alc),
         };
-        try f.index();
+        return f;
+    }
+
+    // Attach feed to an readonly buffer,
+    // and validate it verifying singatures & integrity.
+    pub fn from(allocator: std.mem.Allocator, data: []const u8) !Feed {
+        const f = Feed.wrap(data);
+        try f.validate(allocator);
         return f;
     }
 
@@ -113,66 +126,69 @@ pub const Feed = struct {
     pub fn create(alc: std.mem.Allocator) !Feed {
         return Feed{
             .buffer = .{ .rw = ArrayList(u8).init(alc) },
-            .keychain = ArrayList([32]u8).init(alc),
-            .cache = ArrayList(Block).init(alc),
         };
     }
 
+    // Only required for writable Feeds
+    // that were created via Feed.create()
+    // this function is a no-op for readonly Feeds
     pub fn deinit(self: *Self) void {
         switch (self.buffer) {
             .rw => |list| list.deinit(),
             .ro => {},
         }
-        self.keychain.deinit();
-        self.cache.deinit();
     }
 
-    pub fn iterator(self: *Self) FeedIterator {
+    pub fn iterator(self: *const Self) FeedIterator {
         return .{ .data = self.items(), .offset = 0 };
     }
 
-    pub fn length(self: *Self) usize {
+    pub fn length(self: *const Self) usize {
         var iter = self.iterator();
         var l: usize = 0;
-        while (iter.next()) |segment| {
-            switch (segment) {
-                .block => |_| l += 1,
-                else => {},
-            }
-        }
+        while (iter.nextBlock()) |_| l += 1;
         return l;
     }
 
-    fn index(self: *Self) !void {
-        log.debug("Indexing, tail: {}", .{self.items().len});
-        // var blockIdx = 0;
+    fn validate(self: *const Self, allocator: std.mem.Allocator) !void {
+        var keychain = ArrayList(*const [32]u8).init(allocator);
+        defer keychain.deinit();
+        var parent: Block = undefined;
+        var is_first: bool = true;
         var iter = self.iterator();
         while (iter.next()) |segment| {
             switch (segment) {
                 .key => |public_key| {
                     var found = false;
-                    for (self.keychain.items) |other| {
+                    for (keychain.items) |other| {
                         if (found) break;
-                        found = std.mem.eql(u8, public_key, &other);
+                        found = std.mem.eql(u8, &public_key, other);
                     }
-                    // log.debug("Key: {} {s}", .{ found, hex(public_key) });
-                    if (!found) {
-                        try self.keychain.append(public_key[0..PK_LEN].*);
-                    }
+                    if (!found) try keychain.append(public_key[0..PK_LEN]);
                 },
                 .block => |block| {
                     const b: Block = block;
-                    // try block.verify(&self.keyAt(0));
-                    // try self.cache.append(block);
-                    U.log.debug("Indexing block {s}", .{b.body});
+                    if (is_first) {
+                        is_first = false;
+                    } else { // Commpare signatures
+                        const eql = std.mem.eql(u8, &parent.header.signature, &b.header.parent_signature);
+                        if (!eql) return error.InvalidParent;
+                    }
+                    parent = block;
+                    try block.verify(keychain.items[0].*);
                 },
             }
         }
     }
+
+    pub fn hasGenesis(self: *const Self) bool {
+        const block = self.firstBlock() orelse return false;
+        return std.mem.eql(u8, &block.header.parent_signature, &genesis_signature);
+    }
 };
 
 const FeedSegment = union(enum) {
-    key: []const u8,
+    key: [U.size.pk]u8,
     block: Block,
 };
 const FeedIterator = struct {
@@ -192,7 +208,7 @@ const FeedIterator = struct {
             const end = start + U.size.pk;
             if (end > self.data.len) return error.InvalidLength;
             self.offset += end;
-            return .{ .key = self.data[start..][0..32] };
+            return .{ .key = self.data[start..][0..32].* };
         } else {
             const start = self.offset;
             // Block.from handles size validations.
@@ -201,8 +217,30 @@ const FeedIterator = struct {
             return .{ .block = block };
         }
     }
+    /// Scan to next block, skipping over keys.
+    pub fn nextBlock(self: *FeedIterator) ?Block {
+        while (self.next()) |segment| {
+            switch (segment) {
+                .block => |b| return b,
+                .key => {},
+            }
+        }
+        return null;
+    }
+
+    // Scan to next key, skipping over blocks.
+    pub fn nextKey(self: *FeedIterator) ?[32]u8 {
+        while (self.next()) |segment| {
+            switch (segment) {
+                .block => {},
+                .key => |k| return k,
+            }
+        }
+        return null;
+    }
 };
 
+const expectEqual = testing.expectEqual;
 test "Writable feed" {
     testing.log_level = .debug;
     const test_allocator = testing.allocator;
@@ -212,27 +250,23 @@ test "Writable feed" {
     // Init writable feed
     var feed = try Feed.create(test_allocator);
     defer feed.deinit();
-
-    // try testing.expect(feed.length == 0);
-
-    // Merge remote feed into empty writable
-    // try feed.merge(otherFeed);
-    // try testing.expect(feed.length == 3);
-
-    // Append to remote blocks
+    try expectEqual(false, feed.hasGenesis());
+    try expectEqual(@as(usize, 0), feed.length());
+    // Append
     try feed.append(@as([]const u8, "Hello"), sk);
     try feed.append(@as([]const u8, "World"), sk);
-    const l: usize = feed.length();
-    try testing.expectEqual(l, 5);
+    try expectEqual(@as(usize, 2), feed.length());
+    try expectEqual(true, feed.hasGenesis());
 
     // Print contents of each block
     var iter = feed.iterator();
     while (iter.next()) |segment| {
         switch (segment) {
             .block => |v| log.debug("Block contents: {s}", .{v.body}),
-            .key => |v| log.debug("Key contents: {s}", .{v}),
+            .key => |v| log.debug("Pub Key: {} {s}", .{ v.len, hex(&v) }),
         }
     }
+    try feed.validate(testing.allocator);
 }
 
 test "readonly Feed from Pickle" {
@@ -241,10 +275,10 @@ test "readonly Feed from Pickle" {
     const arr = try Pickle.decode_pickle(testing.allocator, pickle);
     defer arr.deinit();
 
-    var f = try Feed.wrap(testing.allocator, arr.items);
+    var f = try Feed.from(testing.allocator, arr.items);
     defer f.deinit();
-    try f.index();
-    const b: Block = try f.block_at(0);
+    try f.validate(testing.allocator);
+    const b: Block = try f.blockAt(0);
     try testing.expectEqualStrings(b.body, "All your base is all our base");
 }
 

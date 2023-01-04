@@ -46,10 +46,8 @@ pub const Block = struct {
         };
     }
 
-    pub fn verify(self: *const Block, public_key: *const [U.size.pk]u8) !void {
-        const pk = try Sign.PublicKey.fromBytes(public_key[0..U.size.pk].*);
-        const signature = Sign.Signature.fromBytes(self.header.signature);
-        try signature.verify(self.dat, pk);
+    pub fn verify(self: *const Block, public_key: [U.size.pk]u8) !void {
+        try U.signVerify(self.header.signature, self.dat, public_key);
     }
 };
 
@@ -80,27 +78,28 @@ test "Header access via ptrCast" {
     try testing.expectEqualSlices(u8, dummy, &block);
 }
 
-test "I'm an idiot" {
-    testing.log_level = .debug;
-    const A = struct {
-        b: []const u8,
-        c: []const u8,
-    };
-    const bin = [_]u8{ 0, 1, 2, 3, 4, 5 };
-    const a = A{
-        .b = bin[0..4],
-        .c = bin[3..],
-    };
-    U.log.debug("bin@{}, b@{}, c{}", .{
-        @ptrToInt(&bin),
-        @ptrToInt(a.b.ptr),
-        @ptrToInt(a.c.ptr),
-    });
-    var b2: [32]u8 = undefined;
-    const a2 = A{ .b = b2[1..], .c = b2[2..] };
-    U.log.debug("bin2@{}, b@{}, c{}", .{
-        @ptrToInt(&b2),
-        @ptrToInt(a2.b.ptr),
-        @ptrToInt(a2.c.ptr),
-    });
-}
+// Demystifying pointers...
+//test "I'm an idiot" {
+//testing.log_level = .debug;
+//const A = struct {
+//b: []const u8,
+//c: []const u8,
+//};
+//const bin = [_]u8{ 0, 1, 2, 3, 4, 5 };
+//const a = A{
+//.b = bin[0..4],
+//.c = bin[3..],
+//};
+//U.log.debug("bin@{}, b@{}, c{}", .{
+//@ptrToInt(&bin),
+//@ptrToInt(a.b.ptr),
+//@ptrToInt(a.c.ptr),
+//});
+//var b2: [32]u8 = undefined;
+//const a2 = A{ .b = b2[1..], .c = b2[2..] };
+//U.log.debug("bin2@{}, b@{}, c{}", .{
+//@ptrToInt(&b2),
+//@ptrToInt(a2.b.ptr),
+//@ptrToInt(a2.c.ptr),
+//});
+//}
