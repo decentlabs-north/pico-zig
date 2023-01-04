@@ -38,6 +38,7 @@ pub fn decode_pickle(allocator: std.mem.Allocator, src: []const u8) !ArrayList(u
         try chunks.append(chunk);
     }
     var out = try ArrayList(u8).initCapacity(allocator, total_size);
+    errdefer out.deinit();
     out.expandToCapacity();
     var o: usize = 0;
     for (chunks.items) |chunk| {
@@ -105,7 +106,7 @@ pub const PickleIterator = struct {
     }
 };
 
-test "Decode and Encode" {
+test "decode" {
     testing.log_level = .debug;
     var allocator: std.mem.Allocator = testing.allocator;
     const pickle = "PIC0.K0.f5DSHew0QQ9MAmVBoySpiTMqq2UWHNizQdcvta21UuEB0.x70mwrzUXOLTB-SvQrWjEMhn9Y5CSCRTOWPAfS6xXuh_C5IqhIfxtaJLZSz3kY3ot9iiZdO3_yDTQjM5ij74AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdQWxsIHlvdXIgYmFzZSBpcyBhbGwgb3VyIGJhc2U";

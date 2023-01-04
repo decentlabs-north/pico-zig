@@ -1,10 +1,11 @@
 const std = @import("std");
+pub const Sign = std.crypto.sign.Ed25519;
 pub const log = std.log.scoped(.pico);
 
 // Magic numbers
 pub const key_glyph = "K0."; // Maybe redesign into segment-header?
+pub const block_limit = 65536; // 64k
 
-pub const Sign = std.crypto.sign.Ed25519;
 pub const size = struct {
     /// 32Bytes
     pub const pk = Sign.PublicKey.encoded_length;
@@ -14,7 +15,10 @@ pub const size = struct {
     pub const sig = Sign.Signature.encoded_length;
     /// Body-Size Counter: BigEndian u32
     pub const body_counter = 4;
+    /// 132bytes
+    pub const header = body_counter + sig * 2;
 };
+
 pub const hex = std.fmt.fmtSliceHexLower;
 fn parse16(chr: u8) u8 {
     return switch (chr) {
@@ -28,6 +32,7 @@ fn parse16(chr: u8) u8 {
         else => 0,
     };
 }
+
 // TODO: replace with some builtin
 pub fn fromHex(comptime txt: []const u8) []const u8 {
     var bin: [txt.len >> 1]u8 = undefined;

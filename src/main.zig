@@ -7,11 +7,11 @@ const Sign = U.Sign;
 const log = U.log;
 const hex = U.hex;
 pub const Block = @import("block.zig").Block;
+const Header = @import("block.zig").Header;
 // pub const log_level: std.log.Level = .info;
 
-/// Mimic JS-API, returns std.crypto.sign.Ed25519 keypair
-/// for convenience.
-pub fn signPair() Sign.KeyPair {
+// Export keypair generation to WASM
+pub inline fn signPair() Sign.KeyPair {
     return try Sign.KeyPair.create(undefined);
 }
 
@@ -23,83 +23,85 @@ pub const Feed = struct {
     pub const PK_LEN = PublicKey.encoded_length;
     pub const SK_LEN = SecretKey.encoded_length;
 
-    //buf: []u8,
-    //tail: usize = 0,
     keychain: ArrayList([PK_LEN]u8),
     cache: ArrayList(Block),
+    buffer: union(enum) { ro: []const u8, rw: ArrayList(u8) },
 
-    buffer: union(enum) {
-        /// Read-only feed
-        readable: []u8,
-        /// Backed by private array list with growing capacity.
-        writable: ArrayList(u8),
-    },
-
-    inline fn readable(self: *Self) []const u8 {
+    inline fn items(self: *Self) []const u8 {
         switch (self.buffer) {
-            .writable => |v| return v.items,
-            .readable => |v| return v,
+            .rw => |v| return v.items,
+            .ro => |v| return v,
         }
     }
-    inline fn writable(self: *Self) []u8 {
+    inline fn writable(self: *Self) ArrayList(u8) {
         switch (self.buffer) {
-            .writable => |v| return v.items,
-            .readable => unreachable,
+            .rw => |v| return v,
+            .ro => unreachable,
         }
     }
 
-    fn keyAt(self: *Self, idx: usize) [PK_LEN]u8 {
+    fn keyAt(self: *Self, idx: usize) ![PK_LEN]u8 {
         var iter = self.iterator();
-        var n = 0;
+        var n: usize = 0;
         while (iter.next()) |segment| {
             switch (segment) {
                 .key => |k| {
-                    if (n == idx) return k;
+                    if (n == idx) return k[0..PK_LEN];
                     n += 1;
                 },
+                else => {},
             }
         }
+        return error.InvalidIndex;
     }
 
-    pub fn get(self: *Self, idx: usize) Block {
+    pub fn block_at(self: *Self, idx: usize) !Block {
         var iter = self.iterator();
-        var n = 0;
+        var n: usize = 0;
         while (iter.next()) |segment| {
             switch (segment) {
                 .block => |b| {
                     if (n == idx) return b;
                     n += 1;
                 },
+                else => {},
             }
         }
+        return error.InvalidIndex;
     }
 
-    pub fn append(self: *Self, data: []const u8, sk: [SK_LEN]u8) !void {
-        const block_size = data.len + Block.HEADER_LENGTH;
-        const buffer = self.writable();
-        const tail = 0;
+    pub fn append(self: *Self, data: []const u8, secret_key: [SK_LEN]u8) !void {
+        // TODO: self.ensureKey(sk[32..])
+        const block_size = data.len + U.size.header;
+        var memory = self.writable();
+        const tail = memory.items.len;
+        // TODO: self._last_block = tail
 
-        log.debug("BS S:{} s{}", .{ buffer.len, block_size });
-        if (buffer.len < block_size) {
-            return error.OutOfMemory;
-        }
-        const l = @truncate(u32, data.len);
-        log.debug("BATMUT: {} => {}", .{ data.len, l });
-        std.mem.writeIntBig(
-            u32,
-            buffer[tail + 2 * U.size.sig ..][0..4],
-            l,
-        );
-        var block = try Block.from(buffer[tail..]);
-        log.debug("Block s:{} {s}", .{ block.size, block.body });
-        // std.mem.copy(u8, d
-        log.debug("Kek {s}", .{hex(&sk)});
+        const new_size = tail + block_size;
+        if (new_size > U.block_limit) return error.FeedOverflow;
+        try memory.resize(new_size);
+        var buffer = memory.items[tail..][0..block_size];
+        var header = @ptrCast(*Header, buffer.ptr);
+        const psig = [_]u8{0} ** 64; // TODO: lookup prev || genesis
+        std.mem.copy(u8, &header.parent_signature, &psig);
+        header.writeSize(@truncate(u32, data.len));
+        std.mem.copy(u8, buffer[U.size.header..], data);
+
+        const sign_data = buffer[U.size.sig..];
+        const kp = try Sign.KeyPair.fromSecretKey(try Sign.SecretKey.fromBytes(secret_key));
+        const signature = try kp.sign(sign_data, undefined);
+        const sig = signature.toBytes();
+        log.debug("SigGen: L:{}, Hex: {s}", .{ sig.len, hex(&sig) });
+        std.mem.copy(u8, &header.signature, &sig);
+        const block = try Block.from(buffer);
+        try block.verify(secret_key[32..]);
+        log.debug("Block s: {s}", .{block.body});
     }
 
-    /// Attach to an existing buffer in readable mode
-    pub fn wrap(alc: std.mem.Allocator, data: []u8) !Feed {
+    /// Attach to an existing buffer in readonly mode
+    pub fn wrap(alc: std.mem.Allocator, data: []const u8) !Feed {
         var f = Feed{
-            .buffer = .{ .readable = data },
+            .buffer = .{ .ro = data },
             .keychain = ArrayList([32]u8).init(alc),
             .cache = ArrayList(Block).init(alc),
         };
@@ -110,34 +112,42 @@ pub const Feed = struct {
     /// Creates new writable Feed
     pub fn create(alc: std.mem.Allocator) !Feed {
         return Feed{
-            .buffer = .{ .writable = ArrayList(u8).init(alc) },
+            .buffer = .{ .rw = ArrayList(u8).init(alc) },
             .keychain = ArrayList([32]u8).init(alc),
             .cache = ArrayList(Block).init(alc),
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.buffer.writable.deinit();
+        switch (self.buffer) {
+            .rw => |list| list.deinit(),
+            .ro => {},
+        }
         self.keychain.deinit();
         self.cache.deinit();
     }
 
     pub fn iterator(self: *Self) FeedIterator {
-        return .{ .data = self.readable(), .offset = 0 };
+        return .{ .data = self.items(), .offset = 0 };
     }
 
     pub fn length(self: *Self) usize {
         var iter = self.iterator();
         var l: usize = 0;
-        while (try iter.next()) l += 1;
+        while (iter.next()) |segment| {
+            switch (segment) {
+                .block => |_| l += 1,
+                else => {},
+            }
+        }
         return l;
     }
 
     fn index(self: *Self) !void {
-        log.debug("Indexing, tail: {}", .{self.readable().len});
+        log.debug("Indexing, tail: {}", .{self.items().len});
         // var blockIdx = 0;
         var iter = self.iterator();
-        while (try iter.next()) |segment| {
+        while (iter.next()) |segment| {
             switch (segment) {
                 .key => |public_key| {
                     var found = false;
@@ -151,20 +161,27 @@ pub const Feed = struct {
                     }
                 },
                 .block => |block| {
-                    try block.verify(self.keyAt(0));
-                    try self.cache.append(block);
+                    const b: Block = block;
+                    // try block.verify(&self.keyAt(0));
+                    // try self.cache.append(block);
+                    U.log.debug("Indexing block {s}", .{b.body});
                 },
             }
         }
     }
 };
 
-const SegmentType = enum { key, block };
-const FeedSegment = union(SegmentType) { key: []const u8, block: Block };
+const FeedSegment = union(enum) {
+    key: []const u8,
+    block: Block,
+};
 const FeedIterator = struct {
     data: []const u8,
     offset: usize,
-    pub fn next(self: *FeedIterator) !?FeedSegment {
+    pub fn next(self: *FeedIterator) ?FeedSegment {
+        return self.nextErr() catch null;
+    }
+    pub fn nextErr(self: *FeedIterator) !?FeedSegment {
         const key_glyph = U.key_glyph;
         if (self.offset >= self.data.len) return null;
         if (self.offset + key_glyph.len > self.data.len) return null;
@@ -175,12 +192,12 @@ const FeedIterator = struct {
             const end = start + U.size.pk;
             if (end > self.data.len) return error.InvalidLength;
             self.offset += end;
-            return .{ .key = self.data[start..end] };
+            return .{ .key = self.data[start..][0..32] };
         } else {
             const start = self.offset;
             // Block.from handles size validations.
             const block = try Block.from(self.data[start..]);
-            self.offset += block.block_size;
+            self.offset += block.bytes.len;
             return .{ .block = block };
         }
     }
@@ -205,11 +222,12 @@ test "Writable feed" {
     // Append to remote blocks
     try feed.append(@as([]const u8, "Hello"), sk);
     try feed.append(@as([]const u8, "World"), sk);
-    try testing.expect(feed.length() == 5);
+    const l: usize = feed.length();
+    try testing.expectEqual(l, 5);
 
     // Print contents of each block
     var iter = feed.iterator();
-    while (try iter.next()) |segment| {
+    while (iter.next()) |segment| {
         switch (segment) {
             .block => |v| log.debug("Block contents: {s}", .{v.body}),
             .key => |v| log.debug("Key contents: {s}", .{v}),
@@ -222,10 +240,11 @@ test "readonly Feed from Pickle" {
     const pickle = "PIC0.K0.f5DSHew0QQ9MAmVBoySpiTMqq2UWHNizQdcvta21UuEB0.x70mwrzUXOLTB-SvQrWjEMhn9Y5CSCRTOWPAfS6xXuh_C5IqhIfxtaJLZSz3kY3ot9iiZdO3_yDTQjM5ij74AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdQWxsIHlvdXIgYmFzZSBpcyBhbGwgb3VyIGJhc2U";
     const arr = try Pickle.decode_pickle(testing.allocator, pickle);
     defer arr.deinit();
+
     var f = try Feed.wrap(testing.allocator, arr.items);
     defer f.deinit();
     try f.index();
-    const b: Block = f.get(0);
+    const b: Block = try f.block_at(0);
     try testing.expectEqualStrings(b.body, "All your base is all our base");
 }
 
