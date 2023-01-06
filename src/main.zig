@@ -170,7 +170,7 @@ pub const Feed = struct {
                     const b: Block = block;
                     if (is_first) {
                         is_first = false;
-                    } else { // Commpare signatures
+                    } else { // Compare signatures
                         const eql = std.mem.eql(u8, &parent.header.signature, &b.header.parent_signature);
                         if (!eql) return error.InvalidParent;
                     }
@@ -184,6 +184,110 @@ pub const Feed = struct {
     pub fn hasGenesis(self: *const Self) bool {
         const block = self.firstBlock() orelse return false;
         return std.mem.eql(u8, &block.header.parent_signature, &genesis_signature);
+    }
+
+    // Summarizes feed providing quick overview
+    pub fn format(
+        self: *const Feed,
+        comptime _: []const u8, // fmt
+        _: std.fmt.FormatOptions, // fmtOpts
+        writer: anytype,
+    ) !void {
+        var mf = Macrofilm{};
+        try mf.magnify(writer, self);
+    }
+    pub fn inspect(self: *const Feed) void {
+        log.debug("{}", .{self});
+    }
+};
+
+/// **MACROfilm(tm)** pat.pending.
+/// The only medium capable of capturing and magnifying pico-blocks.
+///  ___
+/// |._.|
+/// :[_]:
+/// |._.|
+/// :[_]:
+/// |._.|
+/// :___:
+///
+const Macrofilm = struct {
+    const Self = @This();
+    const bufPrint = std.fmt.bufPrint;
+    const v0 = "| |";
+    const v1 = "|¤|";
+    bf0: [80]u8 = undefined,
+    bf1: [80]u8 = undefined,
+    iw: u8 = 32,
+    state: u8 = 0,
+    pub fn startE(self: *Self, w: anytype, comptime fmt: []const u8, v: anytype) !void {
+        try w.print(fmt, v);
+        self.state += 1;
+    }
+    pub fn magnify(self: *Self, w: anytype, f: *const Feed) !void {
+        var iter = f.iterator();
+        var b: usize = 0;
+        var k: usize = 0;
+        while (iter.next()) |seg| {
+            switch (seg) {
+                .block => b += 1,
+                .key => k += 1,
+            }
+        }
+        try w.print("\n. .{s}. .\n", .{"_" ** 32});
+        const v = try bufPrint(&self.bf0, "PiC0FEED K{d:0>2} B{d:0>4}", .{ k, b });
+        try self.line(w, v);
+        try self.line(w, "_" ** 32);
+        iter = f.iterator();
+        k = 0;
+        while (iter.nextKey()) |key| : (k += 1) {
+            const kl = try bufPrint(&self.bf0, "KEY{d: >2}: {s}...{s}", .{ k, hex(key[0..8]), hex(key[29..]) });
+            try self.line(w, kl);
+        }
+        try self.line(w, "_" ** 32);
+        iter = f.iterator();
+        b = 0;
+        while (iter.nextBlock()) |block| : (b += 1) {
+            const bl = try bufPrint(&self.bf0, "BLK{d: >2}" ++ (" " ** 15) ++ " size: B{d:0>4}", .{
+                b,
+                block.body.len,
+            });
+            try self.line(w, bl);
+            const chain = try bufPrint(&self.bf0, "{s} <= {s}", .{
+                hex(block.header.parent_signature[0..6]),
+                hex(block.header.signature[0..8]),
+            });
+            try self.line(w, chain);
+            try self.hr(w);
+            var o: usize = 0;
+            const nc = 8;
+            const max_lines = 12 * nc;
+            while (o < block.body.len and o < max_lines) : (o += nc) {
+                const ws = @min(block.body.len - o, nc);
+                const bs = block.body[o..][0..ws];
+                var bi: usize = 0;
+                var lb: [32]u8 = undefined;
+                while (bi < lb.len) : (bi += 1) lb[bi] = 0;
+                bi = 0;
+                while (bi < ws) : (bi += 1) {
+                    _ = try bufPrint(lb[bi * 3 ..], "{x:0>2} ", .{bs[bi]});
+                }
+                const hchars = lb[0 .. ws * 3];
+                const dump = try bufPrint(&self.bf0, "{s: <24}{s: <8}", .{ hchars, bs });
+                try self.line(w, dump);
+            }
+            try self.line(w, "_" ** 32);
+        }
+        try w.print(". ." ++ (" " ** 32) ++ ". .\n", .{});
+    }
+    pub fn hr(self: *Self, w: anytype) !void {
+        try self.line(w, "-" ** 32);
+    }
+
+    pub fn line(self: *Self, w: anytype, str: []const u8) !void {
+        const v_b = if (self.state == 0) v0 else v1;
+        try w.print("{s}{s: ^32}{0s}\n", .{ v_b, str });
+        self.state = (self.state + 1) % 2;
     }
 };
 
@@ -280,6 +384,27 @@ test "readonly Feed from Pickle" {
     try f.validate(testing.allocator);
     const b: Block = try f.blockAt(0);
     try testing.expectEqualStrings(b.body, "All your base is all our base");
+    f.inspect();
+}
+
+test "multi author feed" {
+    testing.log_level = .debug;
+    const test_allocator = testing.allocator;
+    var pair = try Sign.KeyPair.create(undefined);
+    const a_sk = pair.secret_key.bytes;
+    pair = try Sign.KeyPair.create(undefined);
+    const b_sk = pair.secret_key.bytes;
+    try testing.expect(!std.mem.eql(u8, &a_sk, &b_sk));
+
+    // Init writable feed
+    var feed = try Feed.create(test_allocator);
+    defer feed.deinit();
+    try feed.append("Hello Bob", a_sk);
+    try feed.append("Alice, sup!", b_sk);
+    try feed.append("All good", a_sk);
+    try feed.append("Very good!", b_sk);
+    try feed.validate(testing.allocator);
+    log.debug("Local: {}", .{feed});
 }
 
 // SK '653e9ae8f5ede09442895291afac3f587310a6ba6209d5b350d9c85b7b074f1d7f90d21dec34410f4c026541a324a989332aab65161cd8b341d72fb5adb552e1'
