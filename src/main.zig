@@ -201,7 +201,7 @@ pub const Feed = struct {
     }
 };
 
-/// **MACROfilm(tm)** pat.pending.
+/// **Macrofilm (tm)** \('>')/
 /// The only medium capable of capturing and magnifying pico-blocks.
 ///  ___
 /// |._.|
@@ -214,79 +214,77 @@ pub const Feed = struct {
 const Macrofilm = struct {
     const Self = @This();
     const bufPrint = std.fmt.bufPrint;
-    const v0 = "| |";
-    const v1 = "|¤|";
-    bf0: [80]u8 = undefined,
-    bf1: [80]u8 = undefined,
-    iw: u8 = 32,
+    const wall0 = "| |";
+    const wall1 = "|¤|";
+    buffer: [80]u8 = undefined,
     state: u8 = 0,
-    pub fn startE(self: *Self, w: anytype, comptime fmt: []const u8, v: anytype) !void {
-        try w.print(fmt, v);
+    pub fn startE(self: *Self, writer: anytype, comptime fmt: []const u8, v: anytype) !void {
+        try writer.print(fmt, v);
         self.state += 1;
     }
-    pub fn magnify(self: *Self, w: anytype, f: *const Feed) !void {
+    pub fn magnify(self: *Self, writer: anytype, f: *const Feed) !void {
         var iter = f.iterator();
-        var b: usize = 0;
-        var k: usize = 0;
+        var n_blocks: usize = 0;
+        var n_keys: usize = 0;
         while (iter.next()) |seg| {
             switch (seg) {
-                .block => b += 1,
-                .key => k += 1,
+                .block => n_blocks += 1,
+                .key => n_keys += 1,
             }
         }
-        try w.print("\n. .{s}. .\n", .{"_" ** 32});
-        const v = try bufPrint(&self.bf0, "PiC0FEED K{d:0>2} B{d:0>4}", .{ k, b });
-        try self.line(w, v);
-        try self.line(w, "_" ** 32);
+        try writer.print("\n. .{s}. .\n", .{"_" ** 32});
+        const feed_header = try bufPrint(&self.buffer, "PiC0FEED K{d:0>2} B{d:0>4}", .{ n_keys, n_blocks });
+        try self.line(writer, feed_header);
+        try self.line(writer, "_" ** 32);
         iter = f.iterator();
-        k = 0;
-        while (iter.nextKey()) |key| : (k += 1) {
-            const kl = try bufPrint(&self.bf0, "KEY{d: >2}: {s}...{s}", .{ k, hex(key[0..8]), hex(key[29..]) });
-            try self.line(w, kl);
+        n_keys = 0; // Reuse as key-index
+        while (iter.nextKey()) |key| : (n_keys += 1) {
+            const key_line = try bufPrint(&self.buffer, "KEY{d: >2}: {s}...{s}", .{ n_keys, hex(key[0..8]), hex(key[29..]) });
+            try self.line(writer, key_line);
         }
-        try self.line(w, "_" ** 32);
+        try self.line(writer, "_" ** 32);
         iter = f.iterator();
-        b = 0;
-        while (iter.nextBlock()) |block| : (b += 1) {
-            const bl = try bufPrint(&self.bf0, "BLK{d: >2}" ++ (" " ** 15) ++ " size: B{d:0>4}", .{
-                b,
+        n_blocks = 0; // Reuse as block-index
+        while (iter.nextBlock()) |block| : (n_blocks += 1) {
+            const block_header = try bufPrint(&self.buffer, "BLK{d: >2}" ++ (" " ** 15) ++ " size: B{d:0>4}", .{
+                n_blocks,
                 block.body.len,
             });
-            try self.line(w, bl);
-            const chain = try bufPrint(&self.bf0, "{s} <= {s}", .{
+            try self.line(writer, block_header);
+            const chain = try bufPrint(&self.buffer, "{s} <= {s}", .{
                 hex(block.header.parent_signature[0..6]),
                 hex(block.header.signature[0..8]),
             });
-            try self.line(w, chain);
-            try self.hr(w);
-            var o: usize = 0;
-            const nc = 8;
-            const max_lines = 12 * nc;
-            while (o < block.body.len and o < max_lines) : (o += nc) {
-                const ws = @min(block.body.len - o, nc);
-                const bs = block.body[o..][0..ws];
-                var bi: usize = 0;
-                var lb: [32]u8 = undefined;
-                while (bi < lb.len) : (bi += 1) lb[bi] = 0;
-                bi = 0;
-                while (bi < ws) : (bi += 1) {
-                    _ = try bufPrint(lb[bi * 3 ..], "{x:0>2} ", .{bs[bi]});
+            try self.line(writer, chain);
+            try self.hr(writer);
+            var offset: usize = 0;
+            const n_bytes = 8;
+            const max_lines = 12 * n_bytes;
+            while (offset < block.body.len and offset < max_lines) : (offset += n_bytes) {
+                const ws = @min(block.body.len - offset, n_bytes);
+                const line_bytes = block.body[offset..][0..ws];
+                var i: usize = 0;
+                var line_buffer: [32]u8 = undefined;
+                while (i < line_buffer.len) : (i += 1) line_buffer[i] = 0; // clear line
+                i = 0;
+                while (i < ws) : (i += 1) { // print one 1 byte + 1space
+                    _ = try bufPrint(line_buffer[i * 3 ..], "{x:0>2} ", .{line_bytes[i]});
                 }
-                const hchars = lb[0 .. ws * 3];
-                const dump = try bufPrint(&self.bf0, "{s: <24}{s: <8}", .{ hchars, bs });
-                try self.line(w, dump);
+                const hex_chars = line_buffer[0 .. ws * 3];
+                const hex_dump = try bufPrint(&self.buffer, "{s: <24}{s: <8}", .{ hex_chars, line_bytes });
+                try self.line(writer, hex_dump);
             }
-            try self.line(w, "_" ** 32);
+            try self.line(writer, "_" ** 32);
         }
-        try w.print(". ." ++ (" " ** 32) ++ ". .\n", .{});
+        try writer.print(". ." ++ (" " ** 32) ++ ". .\n", .{});
     }
     pub fn hr(self: *Self, w: anytype) !void {
-        try self.line(w, "-" ** 32);
+        try self.line(w, "." ** 32);
     }
 
-    pub fn line(self: *Self, w: anytype, str: []const u8) !void {
-        const v_b = if (self.state == 0) v0 else v1;
-        try w.print("{s}{s: ^32}{0s}\n", .{ v_b, str });
+    pub fn line(self: *Self, writer: anytype, value: []const u8) !void {
+        const wall = if (self.state == 0) wall0 else wall1;
+        try writer.print("{s}{s: ^32}{0s}\n", .{ wall, value });
         self.state = (self.state + 1) % 2;
     }
 };
