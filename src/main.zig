@@ -70,27 +70,25 @@ pub const Feed = struct {
     }
 
     pub fn append(self: *Self, data: []const u8, secret_key: [SK_LEN]u8) !void {
+        const parent = self.lastBlock();
+        var psig: [U.size.sig]u8 = genesis_signature;
+        if (parent != null) {
+            psig = parent.?.header.signature;
+        }
         const pk = secret_key[PK_LEN..];
         try self.ensureKey(pk.*);
         const block_size = data.len + U.size.header;
         const memory = &self.buffer.rw;
         const tail = memory.items.len;
-        // TODO: self._last_block = tail (if we reimplement cache)
-
+        // TODO: self._last_block = tail (if we reimplement iterator-cache)
         const new_size = tail + block_size;
-        if (new_size > U.block_limit) return error.FeedOverflow;
+        if (new_size > U.size.max_block) return error.FeedOverflow;
         try memory.resize(new_size);
 
         var buffer = memory.items[tail..][0..block_size];
         var header = @ptrCast(*Header, buffer.ptr);
 
-        const parent = self.lastBlock();
-        if (parent == null) {
-            std.mem.copy(u8, &header.parent_signature, &genesis_signature);
-        } else {
-            const parent_header = parent.?.header;
-            std.mem.copy(u8, &header.parent_signature, &parent_header.signature);
-        }
+        std.mem.copy(u8, &header.parent_signature, &psig);
 
         header.writeSize(@truncate(u32, data.len));
         std.mem.copy(u8, buffer[U.size.header..], data);
@@ -99,7 +97,10 @@ pub const Feed = struct {
         const sig: [64]u8 = try U.sign(sign_data, secret_key, undefined);
         std.mem.copy(u8, &header.signature, &sig);
         const block = try Block.from(buffer);
-        try block.verify(secret_key[32..].*);
+        block.verify(secret_key[32..].*) catch |err| {
+            log.err("Created block failed sigcheck! {!}", .{err});
+            return err;
+        };
     }
 
     /// Attach to an readonly buffer
@@ -175,7 +176,15 @@ pub const Feed = struct {
                         if (!eql) return error.InvalidParent;
                     }
                     parent = block;
-                    try block.verify(keychain.items[0].*);
+                    var i: usize = 0;
+                    var verified = false;
+                    while (!verified and i < keychain.items.len) : (i += 1) {
+                        block.verify(keychain.items[i].*) catch |err| {
+                            if (err != error.SignatureVerificationFailed) return err;
+                            continue;
+                        };
+                        verified = true;
+                    }
                 },
             }
         }
@@ -196,6 +205,7 @@ pub const Feed = struct {
         var mf = Macrofilm{};
         try mf.magnify(writer, self);
     }
+
     pub fn inspect(self: *const Feed) void {
         log.debug("{}", .{self});
     }
@@ -251,9 +261,9 @@ const Macrofilm = struct {
                 block.body.len,
             });
             try self.line(writer, block_header);
-            const chain = try bufPrint(&self.buffer, "{s} <= {s}", .{
+            const chain = try bufPrint(&self.buffer, "{s}  <=  {s}", .{
                 hex(block.header.parent_signature[0..6]),
-                hex(block.header.signature[0..8]),
+                hex(block.header.signature[0..6]),
             });
             try self.line(writer, chain);
             try self.hr(writer);
@@ -296,21 +306,27 @@ const FeedSegment = union(enum) {
 const FeedIterator = struct {
     data: []const u8,
     offset: usize,
+
     pub fn next(self: *FeedIterator) ?FeedSegment {
-        return self.nextErr() catch null;
+        const chunk = self.nextErr() catch |err| {
+            log.debug("Warning! FeedIterator stopped prematurely: {!}", .{err});
+            return null;
+        };
+        return chunk;
     }
+
     pub fn nextErr(self: *FeedIterator) !?FeedSegment {
         const key_glyph = U.key_glyph;
         if (self.offset >= self.data.len) return null;
         if (self.offset + key_glyph.len > self.data.len) return null;
-        const isKey = std.mem.eql(u8, key_glyph, self.data[self.offset..][0..key_glyph.len]);
-        // TODO: prevent key-less feeds? if (!isKey and 0 == self.keychain.items.len) ;
-        if (isKey) {
+        const is_key = std.mem.eql(u8, key_glyph, self.data[self.offset..][0..key_glyph.len]);
+        // TODO: prevent key-less feeds? if (!isKey and 0 == self.keychain.items.len);
+        if (is_key) {
             const start = self.offset + key_glyph.len;
             const end = start + U.size.pk;
             if (end > self.data.len) return error.InvalidLength;
-            self.offset += end;
-            return .{ .key = self.data[start..][0..32].* };
+            self.offset += key_glyph.len + U.size.pk;
+            return .{ .key = self.data[start..][0..U.size.pk].* };
         } else {
             const start = self.offset;
             // Block.from handles size validations.
@@ -319,6 +335,7 @@ const FeedIterator = struct {
             return .{ .block = block };
         }
     }
+
     /// Scan to next block, skipping over keys.
     pub fn nextBlock(self: *FeedIterator) ?Block {
         while (self.next()) |segment| {
@@ -354,6 +371,7 @@ test "Writable feed" {
     defer feed.deinit();
     try expectEqual(false, feed.hasGenesis());
     try expectEqual(@as(usize, 0), feed.length());
+
     // Append
     try feed.append(@as([]const u8, "Hello"), sk);
     try feed.append(@as([]const u8, "World"), sk);
@@ -376,13 +394,12 @@ test "readonly Feed from Pickle" {
     const pickle = "PIC0.K0.f5DSHew0QQ9MAmVBoySpiTMqq2UWHNizQdcvta21UuEB0.x70mwrzUXOLTB-SvQrWjEMhn9Y5CSCRTOWPAfS6xXuh_C5IqhIfxtaJLZSz3kY3ot9iiZdO3_yDTQjM5ij74AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdQWxsIHlvdXIgYmFzZSBpcyBhbGwgb3VyIGJhc2U";
     const arr = try Pickle.decode_pickle(testing.allocator, pickle);
     defer arr.deinit();
-
     var f = try Feed.from(testing.allocator, arr.items);
     defer f.deinit();
     try f.validate(testing.allocator);
     const b: Block = try f.blockAt(0);
     try testing.expectEqualStrings(b.body, "All your base is all our base");
-    f.inspect();
+    // f.inspect();
 }
 
 test "multi author feed" {
@@ -402,6 +419,7 @@ test "multi author feed" {
     try feed.append("All good", a_sk);
     try feed.append("Very good!", b_sk);
     try feed.validate(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), feed.length());
     log.debug("Local: {}", .{feed});
 }
 

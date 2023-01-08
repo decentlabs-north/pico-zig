@@ -37,7 +37,11 @@ pub const Block = struct {
         const body_size = h.readSize();
         const block_size = U.size.header + body_size;
         // `bytes` needs to contain enough data to cover body.
-        if (bytes.len < block_size) return DecodingError.InvalidLength;
+        if (bytes.len < block_size) {
+            U.log.err("BlockError InvalidLength: expected [{}]u8 found [{}]u8", .{ bytes.len, block_size });
+            // try U.hexdump(bytes);
+            return DecodingError.InvalidLength;
+        }
         return .{
             .header = h,
             .bytes = bytes[0..block_size],
