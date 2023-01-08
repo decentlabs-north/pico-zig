@@ -8,13 +8,13 @@ const log = U.log;
 const hex = U.hex;
 pub const Block = @import("block.zig").Block;
 const Header = @import("block.zig").Header;
-// pub const log_level: std.log.Level = .info;
 
 // Export keypair generation to WASM
 pub inline fn signPair() Sign.KeyPair {
     return try Sign.KeyPair.create(undefined);
 }
 pub const genesis_signature = [_]u8{0} ** U.size.sig;
+
 pub const Feed = struct {
     const Self = @This();
     pub const KEY_GLYPH = U.key_glyph;
@@ -103,11 +103,9 @@ pub const Feed = struct {
         };
     }
 
-    /// Attach to an readonly buffer
-    /// without verifying signatures.
-    /// Use Feed.from(allocator, data) to
-    /// decode feeds from untrusted sources.
-    /// `data` must not contain any additional bytes/whitespace.
+    /// Attach to an readonly buffer without verifying signatures.
+    /// Use Feed.from(allocator, data) to decode feeds from untrusted sources.
+    /// Additional bytes/whitespace in `data` are ignored with a warning.
     pub fn wrap(data: []const u8) Feed {
         const f = Feed{
             .buffer = .{ .ro = data },
@@ -128,6 +126,18 @@ pub const Feed = struct {
         return Feed{
             .buffer = .{ .rw = ArrayList(u8).init(alc) },
         };
+    }
+
+    /// Decodes a string that starts with `PIC0`
+    /// heads up, this method returns a writable feed
+    /// that you have to deinit() yourself.
+    /// TODO: Refactor into template Feed(T: .read|.read_write) for comp visibilty
+    pub fn unpickle(allocator: std.mem.Allocator, pickle: []const u8) !Feed {
+        const list = try Pickle.decode_pickle(allocator, pickle);
+        errdefer list.deinit(); // Dealloc if validation fails/ no memory was returned
+        const feed = Feed{ .buffer = .{ .rw = list } };
+        try feed.validate(allocator);
+        return feed;
     }
 
     // Only required for writable Feeds
@@ -242,8 +252,10 @@ const Macrofilm = struct {
                 .key => n_keys += 1,
             }
         }
+        const feed_size = f.items().len;
+        const feed_type: u8 = if (f.hasGenesis()) 'G' else 'P';
         try writer.print("\n. .{s}. .\n", .{"_" ** 32});
-        const feed_header = try bufPrint(&self.buffer, "PiC0FEED K{d:0>2} B{d:0>4}", .{ n_keys, n_blocks });
+        const feed_header = try bufPrint(&self.buffer, "PiC0FEED {c} K{d:0>2} B{d:0>2} {s}", .{ feed_type, n_keys, n_blocks, std.fmt.fmtIntSizeBin(feed_size) });
         try self.line(writer, feed_header);
         try self.line(writer, "_" ** 32);
         iter = f.iterator();
@@ -256,9 +268,9 @@ const Macrofilm = struct {
         iter = f.iterator();
         n_blocks = 0; // Reuse as block-index
         while (iter.nextBlock()) |block| : (n_blocks += 1) {
-            const block_header = try bufPrint(&self.buffer, "BLK{d: >2}" ++ (" " ** 15) ++ " size: B{d:0>4}", .{
+            const block_header = try bufPrint(&self.buffer, "BLOCK{d: >2}" ++ "{s: >25}", .{
                 n_blocks,
-                block.body.len,
+                std.fmt.fmtIntSizeBin(block.body.len),
             });
             try self.line(writer, block_header);
             const chain = try bufPrint(&self.buffer, "{s}  <=  {s}", .{
@@ -377,16 +389,8 @@ test "Writable feed" {
     try feed.append(@as([]const u8, "World"), sk);
     try expectEqual(@as(usize, 2), feed.length());
     try expectEqual(true, feed.hasGenesis());
-
-    // Print contents of each block
-    var iter = feed.iterator();
-    while (iter.next()) |segment| {
-        switch (segment) {
-            .block => |v| log.debug("Block contents: {s}", .{v.body}),
-            .key => |v| log.debug("Pub Key: {} {s}", .{ v.len, hex(&v) }),
-        }
-    }
     try feed.validate(testing.allocator);
+    // feed.inspect();
 }
 
 test "readonly Feed from Pickle" {
@@ -420,9 +424,4 @@ test "multi author feed" {
     try feed.append("Very good!", b_sk);
     try feed.validate(testing.allocator);
     try testing.expectEqual(@as(usize, 4), feed.length());
-    log.debug("Local: {}", .{feed});
 }
-
-// SK '653e9ae8f5ede09442895291afac3f587310a6ba6209d5b350d9c85b7b074f1d7f90d21dec34410f4c026541a324a989332aab65161cd8b341d72fb5adb552e1'
-// Pickle: 'PIC0.K0.f5DSHew0QQ9MAmVBoySpiTMqq2UWHNizQdcvta21UuEB0.x70mwrzUXOLTB-SvQrWjEMhn9Y5CSCRTOWPAfS6xXuh_C5IqhIfxtaJLZSz3kY3ot9iiZdO3_yDTQjM5ij74AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdQWxsIHlvdXIgYmFzZSBpcyBhbGwgb3VyIGJhc2U'
-// BinHex: 4b302e7f90d21dec34410f4c026541a324a989332aab65161cd8b341d72fb5adb552e1c7bd26c2bcd45ce2d307e4af42b5a310c867f58e424824533963c07d2eb15ee87f0b922a8487f1b5a24b652cf7918de8b7d8a265d3b7ff20d34233398a3ef801000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001d416c6c20796f7572206261736520697320616c6c206f75722062617365
