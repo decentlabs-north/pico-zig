@@ -15,10 +15,9 @@ pub const block_glyph = "B0.";
 pub const key_glyph = "K0."; // Pickled
 const KEY_GLYPH = U.key_glyph; // Binary; May change in the future!
 
-const ChunkType = enum { Key, Block };
-const Chunk = struct {
-    chunk_type: ChunkType,
-    data: []const u8,
+const Chunk = union(enum) {
+    block: []const u8,
+    key: []const u8,
 };
 
 /// Decodes unpadded url-safe b64 feeds.
@@ -26,83 +25,84 @@ const Chunk = struct {
 /// (Alpha quality code i fell out of zen)
 pub fn decode_pickle(allocator: std.mem.Allocator, src: []const u8) !ArrayList(u8) {
     const Decoder = std.base64.url_safe_no_pad.Decoder;
-    var iter = PickleIterator{ .buffer = src, .index = 0 };
+    var iter = PickleTokenizer{ .buffer = src, .index = 0 };
     var chunks = ArrayList(Chunk).init(allocator);
     defer chunks.deinit();
     var total_size: usize = 0;
+
     while (iter.next()) |chunk| {
-        if (chunk.chunk_type == ChunkType.Key) {
-            total_size += KEY_GLYPH.len;
-        }
-        total_size += try Decoder.calcSizeForSlice(chunk.data);
+        const data = switch (chunk) {
+            .key => |d| blk: {
+                total_size += KEY_GLYPH.len;
+                break :blk d;
+            },
+            .block => |d| d,
+        };
+        total_size += try Decoder.calcSizeForSlice(data);
         try chunks.append(chunk);
     }
     var out = try ArrayList(u8).initCapacity(allocator, total_size);
-    errdefer out.deinit();
+    errdefer out.deinit(); // Exported mem, deinit only on fail.
     out.expandToCapacity();
     var o: usize = 0;
     for (chunks.items) |chunk| {
-        if (chunk.chunk_type == ChunkType.Key) {
-            std.mem.copy(u8, out.items[o..], KEY_GLYPH);
-            o += KEY_GLYPH.len;
-        }
-        const required = try Decoder.calcSizeForSlice(chunk.data);
-        try Decoder.decode(out.items[o..], chunk.data);
+        const data = switch (chunk) {
+            .key => |d| blk: {
+                std.mem.copy(u8, out.items[o..], KEY_GLYPH);
+                o += KEY_GLYPH.len;
+                break :blk d;
+            },
+            .block => |d| d,
+        };
+        const required = try Decoder.calcSizeForSlice(data);
+        Decoder.decode(out.items[o..], data) catch |err| {
+            U.log.debug("Base64 Decode failed for: {s}", .{data});
+            return err;
+        };
         o += required;
     }
     return out;
 }
 
-pub const PickleIterator = struct {
+pub const PickleTokenizer = struct {
+    const Self = @This();
+    const Token = struct { key: bool, offset: usize };
     buffer: []const u8,
     index: usize,
-    const Self = @This();
 
     pub fn next(self: *Self) ?Chunk {
+        // Fastforward index past pickle identifier on first run
         if (self.index == 0) {
-            // Fastforward index past pickle identifier
-            self.index = std.mem.indexOf(u8, self.buffer[self.index..], pickle_glyph) orelse return null;
+            const o = std.mem.indexOf(u8, self.buffer[self.index..], pickle_glyph) orelse return null;
+            self.index = o + pickle_glyph.len;
         }
         // Head of casette should be a glyph
-        const startToken = seek(self.buffer, self.index) orelse return null;
-        const start = startToken.end;
-        const endToken = seek(self.buffer, start);
-        const end = if (endToken != null) endToken.?.start else self.buffer.len;
-        if (end - start < 1) return null;
-        self.index += end;
-        return .{
-            .chunk_type = startToken.c_type,
-            .data = self.buffer[start..end],
-        };
+        const start_token = self.seek(self.index) orelse return null;
+        const c_start = self.index + start_token.offset + tSize(start_token.key);
+        const endToken = self.seek(c_start);
+        const c_end = if (endToken != null) c_start + endToken.?.offset else self.buffer.len;
+
+        if (c_end - c_start < 1) return null;
+        self.index = c_end;
+        const d = self.buffer[c_start..c_end];
+        return if (start_token.key) .{ .key = d } else .{ .block = d };
+    }
+    inline fn tSize(key: bool) usize {
+        return if (key) key_glyph.len else block_glyph.len;
     }
 
-    const Token = struct { start: usize, end: usize, c_type: ChunkType };
-
-    // returns indexOf next glyph
-    fn seek(buffer: []const u8, offset: ?usize) ?Token {
-        var o = offset orelse 0;
-        var key_inc: usize = 0;
-        var block_inc: usize = 0;
-        while (o < buffer.len) : (o += 1) {
-            const c = buffer[o];
-            if (c == key_glyph[key_inc]) {
-                key_inc += 1;
-                if (key_inc == key_glyph.len) return .{
-                    .c_type = ChunkType.Key,
-                    .start = o - key_glyph.len + 1,
-                    .end = o + 1,
-                };
-            } else key_inc = 0;
-            if (c == block_glyph[block_inc]) {
-                block_inc += 1;
-                if (block_inc == block_glyph.len) return .{
-                    .c_type = ChunkType.Block,
-                    .start = o - block_glyph.len + 1,
-                    .end = o + 1,
-                };
-            } else block_inc = 0;
+    /// returns relative offset to input offset.
+    fn seek(self: *Self, offset: usize) ?Token {
+        const kr = std.mem.indexOf(u8, self.buffer[offset..], key_glyph);
+        const br = std.mem.indexOf(u8, self.buffer[offset..], block_glyph);
+        if (kr == null and br == null) return null;
+        if (kr != null and br != null and kr.? < br.?) {
+            return .{ .key = true, .offset = kr.? };
+        } else if (kr == null) {
+            return .{ .key = false, .offset = br.? };
+        } else {
+            return .{ .key = false, .offset = br.? };
         }
-        return null;
     }
 };
 

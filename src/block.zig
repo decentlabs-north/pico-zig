@@ -38,8 +38,9 @@ pub const Block = struct {
         const block_size = U.size.header + body_size;
         // `bytes` needs to contain enough data to cover body.
         if (bytes.len < block_size) {
-            U.log.err("BlockError InvalidLength: expected [{}]u8 found [{}]u8", .{ bytes.len, block_size });
-            // try U.hexdump(bytes);
+            U.log.err("BlockError InvalidLength: remain [{}]u8 requested [{}]u8", .{ bytes.len, block_size });
+            U.log.err("BigEndian hex: {s}", .{U.hex(bytes[128..][0..4])});
+            try U.hexdump(bytes);
             return DecodingError.InvalidLength;
         }
         return .{
